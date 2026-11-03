@@ -113,6 +113,13 @@ func TestSummaryUsesThePeriodAsWindow(t *testing.T) {
 	h.wantNotes(lines("[throttle] dropped 1,204 lines in the last 10s"))
 }
 
+func TestFractionalPeriodSummaryIsRounded(t *testing.T) {
+	h := newHarness(t, "1/2.05m")
+	h.feed("a", "b")
+	h.advance(2*time.Minute + 3*time.Second)
+	h.wantNotes(lines("[throttle] dropped 1 line in the last 2m3s"))
+}
+
 func TestQuietWindowsAreSilent(t *testing.T) {
 	h := newHarness(t, "10")
 	h.feed("a", "b")
