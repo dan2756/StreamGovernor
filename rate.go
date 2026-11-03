@@ -70,7 +70,10 @@ func parsePeriod(s string) (time.Duration, error) {
 		if f < 1 || f >= math.MaxInt64 {
 			return 0, fmt.Errorf("period %q out of range", s)
 		}
-		return time.Duration(f), nil
+		// 2.05 * Minute is 122999999999.999..., and truncating that yields
+		// 2m2.999999999s, which then shows up in summaries. Nearest nanosecond
+		// matches time.ParseDuration for the units it accepts.
+		return time.Duration(math.Round(f)), nil
 	}
 	d, err := time.ParseDuration(s)
 	if err != nil {
