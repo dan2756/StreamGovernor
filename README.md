@@ -133,7 +133,8 @@ untouched. A final line with no trailing newline is written with one added.
 On Ctrl-C (SIGINT) or SIGTERM, `throttle` stops reading, emits any line held
 for `--keep-last`, and prints the total before exiting. With `--delay`,
 lines still waiting in the queue are discarded and counted as dropped.
-Lines read before the signal are still passed on, so if whatever reads
+Lines already read are still passed on, including a partial line that
+has no newline yet (it is written with one added). If whatever reads
 the output has stopped reading, `throttle` waits for it. A second signal
 kills it at once, whatever it is doing.
 

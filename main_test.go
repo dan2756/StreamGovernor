@@ -336,6 +336,163 @@ func (r *blockingReader) Read(p []byte) (int, error) {
 	return 0, io.EOF
 }
 
+// readyBuf is a Writer tests can read while run is still using it.
+type readyBuf struct {
+	mu    sync.Mutex
+	buf   bytes.Buffer
+	ready chan struct{}
+	once  sync.Once
+	want  string
+}
+
+func newReadyBuf(want string) *readyBuf {
+	return &readyBuf{ready: make(chan struct{}), want: want}
+}
+
+func (w *readyBuf) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	n, err := w.buf.Write(p)
+	if strings.Contains(w.buf.String(), w.want) {
+		w.once.Do(func() { close(w.ready) })
+	}
+	return n, err
+}
+
+func (w *readyBuf) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.String()
+}
+
+// TestInterruptEmitsPartialLineAlreadyRead checks that a line split across
+// reads is not dropped when the process is signaled while the rest of the
+// line is still outstanding. "wor" has already been read; only the newline
+// is missing.
+func TestInterruptEmitsPartialLineAlreadyRead(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { r.Close(); w.Close() })
+	if _, err := w.Write([]byte("hello\nwor")); err != nil {
+		t.Fatal(err)
+	}
+	out := newReadyBuf("hello\n")
+	var errOut bytes.Buffer
+	stop := make(chan os.Signal, 1)
+	done := make(chan int, 1)
+	go func() {
+		done <- run([]string{"1000/s", "--no-summary"}, r, out, &errOut, stop)
+	}()
+	select {
+	case <-out.ready:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the complete line")
+	}
+	stop <- syscall.SIGINT
+	select {
+	case code := <-done:
+		if code != 130 {
+			t.Fatalf("exit %d, want 130; stderr %q", code, errOut.String())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("interrupt with a partial line already read hung")
+	}
+	if got := out.String(); got != "hello\nwor\n" {
+		t.Fatalf("stdout %q, want the partial line written with a newline", got)
+	}
+}
+
+// TestInterruptCountsDroppedPartialLine checks that a partial line which
+// does not pass the rate still shows up in the total, instead of vanishing.
+func TestInterruptCountsDroppedPartialLine(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { r.Close(); w.Close() })
+	if _, err := w.Write([]byte("a\nwor")); err != nil {
+		t.Fatal(err)
+	}
+	out := newReadyBuf("a\n")
+	var errOut bytes.Buffer
+	stop := make(chan os.Signal, 1)
+	done := make(chan int, 1)
+	go func() {
+		done <- run([]string{"1"}, r, out, &errOut, stop)
+	}()
+	select {
+	case <-out.ready:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the first line")
+	}
+	stop <- syscall.SIGINT
+	select {
+	case code := <-done:
+		if code != 130 {
+			t.Fatalf("exit %d, want 130", code)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("interrupt hung")
+	}
+	if got := out.String(); got != "a\n" {
+		t.Fatalf("stdout %q, want only the line that passed", got)
+	}
+	if m := totalRE.FindStringSubmatch(errOut.String()); m == nil || m[1] != "1" || m[2] != "2" {
+		t.Fatalf("stderr %q, want 1 of 2 dropped", errOut.String())
+	}
+}
+
+type blockingThenData struct {
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+	data    []byte
+}
+
+func (r *blockingThenData) Read(p []byte) (int, error) {
+	r.once.Do(func() { close(r.entered) })
+	<-r.release
+	return copy(p, r.data), nil
+}
+
+func TestStopReaderKeepsBytesFromInFlightRead(t *testing.T) {
+	src := &lineSource{flushReq: make(chan struct{}), state: make(chan struct{})}
+	r := &blockingThenData{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+		data:    []byte("ld\n"),
+	}
+	sr := &stopReader{r: r, src: src}
+	buf := make([]byte, 8)
+	type result struct {
+		n   int
+		err error
+		s   string
+	}
+	got := make(chan result, 1)
+	go func() {
+		n, err := sr.Read(buf)
+		got <- result{n, err, string(buf[:n])}
+	}()
+	select {
+	case <-r.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Read did not start")
+	}
+	close(src.flushReq)
+	close(r.release)
+	select {
+	case res := <-got:
+		if res.n != 3 || res.s != "ld\n" || !errors.Is(res.err, errStopped) {
+			t.Fatalf("Read = %d %q %v, want 3 %q errStopped", res.n, res.s, res.err, "ld\n")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("in-flight Read did not return")
+	}
+}
+
 func TestInterruptWhileWaitingForInput(t *testing.T) {
 	r := &blockingReader{done: make(chan struct{}), entered: make(chan struct{})}
 	t.Cleanup(func() { close(r.done) })

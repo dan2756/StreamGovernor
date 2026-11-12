@@ -22,9 +22,10 @@ type lineSource struct {
 	flushReq chan struct{} // closed to deliver buffered lines and stop reading
 	err      error         // read error other than EOF; valid once lines is closed
 
-	mu      sync.Mutex
-	reading bool          // true while blocked in the underlying Read
-	state   chan struct{} // closed and replaced when reading changes, or the goroutine exits
+	mu       sync.Mutex
+	reading  bool          // true while blocked in the underlying Read
+	state    chan struct{} // closed and replaced when reading changes, or the goroutine exits
+	deadline interface{ SetReadDeadline(time.Time) error }
 }
 
 func readLines(r io.Reader) *lineSource {
@@ -33,6 +34,9 @@ func readLines(r io.Reader) *lineSource {
 		done:     make(chan struct{}),
 		flushReq: make(chan struct{}),
 		state:    make(chan struct{}),
+	}
+	if d, ok := r.(interface{ SetReadDeadline(time.Time) error }); ok {
+		s.deadline = d
 	}
 	go s.read(r)
 	return s
@@ -160,9 +164,22 @@ func (s *lineSource) snapshot() (reading bool, state <-chan struct{}) {
 	return s.reading, s.state
 }
 
+// unblockRead interrupts a Read blocked on a pipe or terminal so the reader
+// goroutine can hand over bytes it already has. A zero Time would clear the
+// deadline, so the time is merely in the past. Readers that cannot be
+// interrupted report false and drain leaves that Read alone.
+func (s *lineSource) unblockRead() bool {
+	if s.deadline == nil {
+		return false
+	}
+	return s.deadline.SetReadDeadline(time.Unix(0, 1)) == nil
+}
+
 // drain delivers lines already taken from the input, then returns when the
-// reader is blocked waiting for more or has exited.
+// reader is blocked waiting for more or has exited. When the read can be
+// interrupted, it also delivers a partial line already buffered.
 func (s *lineSource) drain(t *throttler) error {
+	unblocked := s.unblockRead()
 	for {
 		select {
 		case line, ok := <-s.lines:
@@ -174,10 +191,10 @@ func (s *lineSource) drain(t *throttler) error {
 			}
 		default:
 			reading, state := s.snapshot()
-			if reading {
-				// Blocked on new input, so every complete line already read
-				// has been queued. Take those, then stop; waiting for the
-				// Read would hang on a quiet stdin.
+			if reading && !unblocked {
+				// Blocked on new input and that Read cannot be interrupted.
+				// Every complete line already read has been queued. Take
+				// those, then stop; waiting for the Read would hang.
 				select {
 				case line, ok := <-s.lines:
 					if !ok {
@@ -224,9 +241,13 @@ func (r *stopReader) Read(p []byte) (int, error) {
 	}
 	n, err := r.r.Read(p)
 	if r.src.flushRequested() {
-		// This Read was already in flight. Those bytes were not sitting in
-		// the buffer when the flush was requested; leave them unread by
-		// the line splitter.
+		// This Read was already in flight. The bytes it returned have been
+		// taken from the underlying reader, so they have to be passed on;
+		// dropping them would lose them from both the output and the summary.
+		// A zero count (the read was only waiting) stops the splitter.
+		if n > 0 {
+			return n, errStopped
+		}
 		return 0, errStopped
 	}
 	return n, err
@@ -266,7 +287,8 @@ func (a *alarm) stop() {
 // deadline passes. It returns once the input has ended and every queued
 // line has been released, or when a signal arrives on stop. A signal first
 // passes on every line already read, including lines the reader has buffered
-// but not yet handed over, and then returns that signal.
+// but not yet handed over and a trailing partial line, and then returns
+// that signal.
 func pump(t *throttler, r io.Reader, stop <-chan os.Signal) (os.Signal, error) {
 	src := readLines(r)
 	defer src.stop()
