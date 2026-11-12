@@ -27,11 +27,13 @@ func TestParseRate(t *testing.T) {
 		{"1/4.1ms", 1, 4100 * time.Microsecond},
 		{"1/8.2ms", 1, 8200 * time.Microsecond},
 		{"1/0.57d", 1, 57 * 24 * time.Hour / 100},
+		{"1/32.02d", 1, 768*time.Hour + 28*time.Minute + 48*time.Second},
 		{"10/500ms", 10, 500 * time.Millisecond},
 		{"1000/h", 1000, time.Hour},
 		{"1000/Hour", 1000, time.Hour},
 		{"50/1h30m", 50, 90 * time.Minute},
 		{"7/d", 7, 24 * time.Hour},
+		{"1/9223372036.854775807s", 1, time.Duration(1<<63 - 1)},
 	}
 	for _, tt := range tests {
 		count, period, err := parseRate(tt.in)
@@ -62,8 +64,8 @@ func TestParseRateErrors(t *testing.T) {
 		{"5/-1m", "must be positive"},
 		{"5/1..5s", "invalid period"},
 		{"5/106752d", "out of range"},
-		{"5/106751.99116730064d", "out of range"},   // exactly 2^63ns as a float64
-		{"5/9223372036.854775807s", "out of range"}, // likewise
+		{"5/106751.99116730065d", "out of range"},
+		{"5/9223372036.854775808s", "out of range"},
 	}
 	for _, tt := range tests {
 		_, _, err := parseRate(tt.in)

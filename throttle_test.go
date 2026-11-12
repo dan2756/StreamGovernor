@@ -120,6 +120,15 @@ func TestFractionalPeriodSummaryIsRounded(t *testing.T) {
 	h.wantNotes(lines("[throttle] dropped 1 line in the last 2m3s"))
 }
 
+func TestFractionalDaySummaryIsExact(t *testing.T) {
+	// 32.02 days is not exact in float64; rounding via float64 leaves a
+	// stray nanosecond in the summary.
+	h := newHarness(t, "1/32.02d")
+	h.feed("a", "b")
+	h.advance(768*time.Hour + 28*time.Minute + 48*time.Second)
+	h.wantNotes(lines("[throttle] dropped 1 line in the last 768h28m48s"))
+}
+
 func TestQuietWindowsAreSilent(t *testing.T) {
 	h := newHarness(t, "10")
 	h.feed("a", "b")

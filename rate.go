@@ -1,8 +1,9 @@
 package main
 
 import (
+	"errors"
 	"fmt"
-	"math"
+	"math/big"
 	"strconv"
 	"strings"
 	"time"
@@ -55,25 +56,21 @@ func parsePeriod(s string) (time.Duration, error) {
 		num, unit = s[:i], s[i:]
 	}
 	if u, ok := periodUnits[strings.ToLower(unit)]; ok {
-		n := 1.0
-		if num != "" {
-			var err error
-			if n, err = strconv.ParseFloat(num, 64); err != nil {
+		if num == "" {
+			return u, nil
+		}
+		d, err := scaleDecimal(num, u)
+		if err != nil {
+			switch {
+			case errors.Is(err, errBadDecimal):
 				return 0, fmt.Errorf("invalid period %q", s)
+			case errors.Is(err, errNonPositive):
+				return 0, fmt.Errorf("period %q must be positive", s)
+			default:
+				return 0, fmt.Errorf("period %q out of range", s)
 			}
 		}
-		f := n * float64(u)
-		if f <= 0 {
-			return 0, fmt.Errorf("period %q must be positive", s)
-		}
-		// MaxInt64 rounds up to 2^63 as a float64, which is already too big.
-		if f < 1 || f >= math.MaxInt64 {
-			return 0, fmt.Errorf("period %q out of range", s)
-		}
-		// 2.05 * Minute is 122999999999.999..., and truncating that yields
-		// 2m2.999999999s, which then shows up in summaries. Nearest nanosecond
-		// matches time.ParseDuration for the units it accepts.
-		return time.Duration(math.Round(f)), nil
+		return d, nil
 	}
 	d, err := time.ParseDuration(s)
 	if err != nil {
@@ -83,4 +80,39 @@ func parsePeriod(s string) (time.Duration, error) {
 		return 0, fmt.Errorf("period %q must be positive", s)
 	}
 	return d, nil
+}
+
+var (
+	errBadDecimal  = errors.New("bad decimal")
+	errNonPositive = errors.New("non-positive")
+	errOutOfRange  = errors.New("out of range")
+)
+
+// scaleDecimal returns the nearest nanosecond of num*unit. num is a decimal
+// such as "2.05" or ".5". Float multiplication is not used: 32.02 days is
+// not exact in float64, and the extra nanosecond shows up in summaries.
+func scaleDecimal(num string, unit time.Duration) (time.Duration, error) {
+	r, ok := new(big.Rat).SetString(num)
+	if !ok {
+		return 0, errBadDecimal
+	}
+	if r.Sign() <= 0 {
+		return 0, errNonPositive
+	}
+	r.Mul(r, new(big.Rat).SetInt64(int64(unit)))
+	// Round half away from zero: (2n + d) / (2d).
+	n := new(big.Int).Set(r.Num())
+	d := new(big.Int).Set(r.Denom())
+	n.Lsh(n, 1)
+	n.Add(n, d)
+	d.Lsh(d, 1)
+	n.Quo(n, d)
+	if !n.IsInt64() {
+		return 0, errOutOfRange
+	}
+	v := n.Int64()
+	if v <= 0 {
+		return 0, errOutOfRange
+	}
+	return time.Duration(v), nil
 }
